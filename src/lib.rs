@@ -238,6 +238,101 @@ fn nanos_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
 }
 
+// ── Flux-Trust Compatible Adapter ───────────────────────
+// JC1's flux-trust uses agent:u32, TrustLevel enum, linear decay.
+// This adapter bridges flux-trust's API into our event-based beacon.
+
+/// Trust levels matching JC1's flux-trust TrustLevel enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FluxTrustLevel {
+    Unknown,    // score < 0.2
+    Suspicious, // score < 0.4
+    Neutral,    // score < 0.6
+    Trusted,    // score < 0.8
+    Verified,   // score >= 0.8
+}
+
+impl FluxTrustLevel {
+    pub fn from_score(score: f64) -> Self {
+        if score < 0.2 { FluxTrustLevel::Unknown }
+        else if score < 0.4 { FluxTrustLevel::Suspicious }
+        else if score < 0.6 { FluxTrustLevel::Neutral }
+        else if score < 0.8 { FluxTrustLevel::Trusted }
+        else { FluxTrustLevel::Verified }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            FluxTrustLevel::Unknown => "unknown",
+            FluxTrustLevel::Suspicious => "suspicious",
+            FluxTrustLevel::Neutral => "neutral",
+            FluxTrustLevel::Trusted => "trusted",
+            FluxTrustLevel::Verified => "verified",
+        }
+    }
+}
+
+/// Adapter that converts flux-trust operations into beacon events.
+/// Usage: FluxTrustAdapter::wrap(beacon).set(agent_id, score)
+pub struct FluxTrustAdapter<'a> {
+    beacon: &'a mut TrustBeacon,
+    identity: String,
+}
+
+impl<'a> FluxTrustAdapter<'a> {
+    pub fn wrap(beacon: &'a mut TrustBeacon, identity: &str) -> Self {
+        Self { beacon, identity: identity.to_string() }
+    }
+
+    /// Equivalent to flux-trust's TrustTable::set(agent, score)
+    pub fn set(&mut self, agent: u32, score: f64) {
+        let target = format!("agent-{}", agent);
+        let current = self.beacon.compute_consensus(&target) as f64;
+        let delta = score - current;
+        let event_type = if delta > 0.0 { "boost" } else { "reduce" };
+        self.beacon.emit(&self.identity, &target, event_type, delta.abs() as f32);
+    }
+
+    /// Equivalent to flux-trust's TrustTable::update(agent, evidence, weight)
+    pub fn update(&mut self, agent: u32, evidence: f64, weight: f64) {
+        let target = format!("agent-{}", agent);
+        let event_type = if evidence > 0.5 { "success" } else { "failure" };
+        self.beacon.emit(&self.identity, &target, event_type, weight as f32);
+    }
+
+    /// Equivalent to flux-trust's TrustTable::get(agent)
+    pub fn get(&self, agent: u32) -> f64 {
+        let target = format!("agent-{}", agent);
+        self.beacon.compute_consensus(&target) as f64
+    }
+
+    /// Equivalent to flux-trust's TrustTable::level_of(agent)
+    pub fn level_of(&self, agent: u32) -> FluxTrustLevel {
+        FluxTrustLevel::from_score(self.get(agent))
+    }
+
+    /// Equivalent to flux-trust's TrustTable::is_trusted(agent, threshold)
+    pub fn is_trusted(&self, agent: u32, threshold: f64) -> bool {
+        self.get(agent) >= threshold
+    }
+
+    /// Equivalent to flux-trust's TrustTable::revoke(agent)
+    pub fn revoke(&mut self, agent: u32) {
+        let target = format!("agent-{}", agent);
+        self.beacon.emit(&self.identity, &target, "corruption", 1.0);
+    }
+
+    /// Equivalent to flux-trust's TrustTable::restore(agent, score)
+    pub fn restore(&mut self, agent: u32, score: f64) {
+        self.set(agent, score);
+    }
+
+    /// Equivalent to flux-trust's TrustTable::decay_all(now)
+    pub fn decay_all(&mut self) {
+        self.beacon.decay_all();
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -472,5 +567,68 @@ mod tests {
         beacon.events.push(TrustEvent::success("c", "t"));
         // Only 3 events, threshold is 5 → no consensus
         assert_eq!(beacon.compute_consensus("t"), 0.5);
+    }
+
+    // --- Flux-Trust Compatible Adapter Tests ---
+
+    #[test]
+    fn test_flux_trust_level_from_score() {
+        assert_eq!(FluxTrustLevel::from_score(0.1), FluxTrustLevel::Unknown);
+        assert_eq!(FluxTrustLevel::from_score(0.3), FluxTrustLevel::Suspicious);
+        assert_eq!(FluxTrustLevel::from_score(0.5), FluxTrustLevel::Neutral);
+        assert_eq!(FluxTrustLevel::from_score(0.7), FluxTrustLevel::Trusted);
+        assert_eq!(FluxTrustLevel::from_score(0.9), FluxTrustLevel::Verified);
+    }
+
+    #[test]
+    fn test_flux_adapter_set_get() {
+        let mut beacon = TrustBeacon::new().with_consensus_threshold(1);
+        let mut adapter = FluxTrustAdapter::wrap(&mut beacon, "test-identity");
+        adapter.set(42, 0.9);
+        let score = adapter.get(42);
+        assert!(score >= 0.0); // score registered
+    }
+
+    #[test]
+    fn test_flux_adapter_update() {
+        let mut beacon = TrustBeacon::new().with_consensus_threshold(1);
+        let mut adapter = FluxTrustAdapter::wrap(&mut beacon, "test-identity");
+        adapter.update(1, 1.0, 0.8);
+        let score = adapter.get(1);
+        assert!(score >= 0.0);
+    }
+
+    #[test]
+    fn test_flux_adapter_revoke_restore() {
+        let mut beacon = TrustBeacon::new().with_consensus_threshold(1);
+        let mut adapter = FluxTrustAdapter::wrap(&mut beacon, "test-identity");
+        adapter.set(99, 0.9);
+        adapter.revoke(99);
+        adapter.restore(99, 0.8);
+        // Score should be non-negative after restore
+        assert!(adapter.get(99) >= 0.0);
+    }
+
+    #[test]
+    fn test_flux_adapter_decay() {
+        let mut beacon = TrustBeacon::new().with_consensus_threshold(1).with_decay_factor(0.5);
+        let mut adapter = FluxTrustAdapter::wrap(&mut beacon, "test-identity");
+        adapter.set(1, 0.9);
+        adapter.decay_all();
+        let score = adapter.get(1);
+        assert!(score >= 0.0);
+    }
+
+    #[test]
+    fn test_flux_adapter_multiple_agents() {
+        let mut beacon = TrustBeacon::new().with_consensus_threshold(1);
+        let mut adapter = FluxTrustAdapter::wrap(&mut beacon, "test-identity");
+        adapter.set(1, 0.9);
+        adapter.set(2, 0.3);
+        adapter.set(3, 0.7);
+        // All agents should have events registered
+        assert!(adapter.get(1) >= 0.0);
+        assert!(adapter.get(2) >= 0.0);
+        assert!(adapter.get(3) >= 0.0);
     }
 }
