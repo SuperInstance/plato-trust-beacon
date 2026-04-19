@@ -1,0 +1,5 @@
+[package]
+name = "plato-trust-beacon"
+version = "0.1.0"
+edition = "2021"
+description = "BeaconLayer adapter — trust event emission, observation, and consensus"
