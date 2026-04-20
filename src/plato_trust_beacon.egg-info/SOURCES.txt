@@ -1,0 +1,8 @@
+README.md
+pyproject.toml
+src/plato_trust_beacon/__init__.py
+src/plato_trust_beacon/beacon.py
+src/plato_trust_beacon.egg-info/PKG-INFO
+src/plato_trust_beacon.egg-info/SOURCES.txt
+src/plato_trust_beacon.egg-info/dependency_links.txt
+src/plato_trust_beacon.egg-info/top_level.txt

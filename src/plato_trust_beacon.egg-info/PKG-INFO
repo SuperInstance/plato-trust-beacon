@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: plato-trust-beacon
+Version: 0.1.0
+Summary: Trust beacon — emit, receive, aggregate trust signals across agents
+License: MIT
+Requires-Python: >=3.8
